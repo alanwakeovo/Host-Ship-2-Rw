@@ -82,14 +82,20 @@ def get_days(text):
     if not text:
         return None
 
-    match = re.search(
-        r"(\d+)\s*Days?",
-        text,
-        re.I
-    )
+    # 优先匹配带 EXPIRES 或 Renewal 的天数，避免误匹配 Maximum 14 days reached
+    patterns = [
+        r"(\d+)\s*Days?\s*\(EXPIRES",
+        r"EXPIRES[^\n\d]*\n\s*(\d+)\s*Days?",
+        r"Renewal\s+in\s+(\d+)\s*Days?",
+        r"Renew\s+in\s+(\d+)\s*Days?",
+        r"(\d+)\s*Days?\s+until\s+renewal",
+        r"^(\d+)\s*Days?\b",
+    ]
 
-    if match:
-        return int(match.group(1))
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return int(match.group(1))
 
     return None
 
@@ -104,9 +110,12 @@ def estimate_renew_date(status):
     if days is None:
         return None
 
+    # 面板规则：低于 14 天（<= 13 天）时才可续期
+    wait_days = days - 13 if days >= 14 else 0
+
     return (
         beijing_now().date()
-        + timedelta(days=days)
+        + timedelta(days=wait_days)
     )
 
 
@@ -193,23 +202,26 @@ def build_check_message(status, ip):
         f"📍 出口IP：{ip}",
         f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}",
         "",
-        "🔒 当前状态：未到续期时间",
+        "🔒 当前状态：未到续期时间（需低于 14 天）",
     ]
 
     if days is not None:
         lines.append(
-            f"⏱️ 距离续期：约 {days} 天"
+            f"⏱️ 剩余有效期：{status}"
+        )
+        wait_days = max(0, days - 13)
+        lines.append(
+            f"⏳ 距离可续期：约 {wait_days} 天"
+        )
+    else:
+        lines.append(
+            f"📅 面板状态：{status}"
         )
 
     if renew_date is not None:
         lines.append(
             "📆 预计可续期："
             + renew_date.strftime("%Y/%m/%d")
-        )
-
-    if days is None:
-        lines.append(
-            f"📅 面板状态：{status}"
         )
 
     lines.append(
@@ -236,7 +248,7 @@ def build_success_message(before, after, ip):
 
     if before_days is not None:
         lines.append(
-            f"📅 续期前：约 {before_days} 天"
+            f"📅 续期前：约 {before_days} 天 ({before})"
         )
     else:
         lines.append(
@@ -245,7 +257,7 @@ def build_success_message(before, after, ip):
 
     if after_days is not None:
         lines.append(
-            f"✅ 续期后：约 {after_days} 天"
+            f"✅ 续期后：约 {after_days} 天 ({after})"
         )
     else:
         lines.append(
@@ -311,7 +323,6 @@ def is_submit_ready(submit):
 
 def click_turnstile_box(page, password_locator=None, submit_locator=None):
     """尝试定位并点击 Cloudflare Turnstile 验证框"""
-    # 1. 优先尝试直接从 frames 中点击 Cloudflare 内部复选框
     for frame in page.frames:
         frame_url = (frame.url or "").lower()
         if "challenges.cloudflare.com" in frame_url or "turnstile" in frame_url:
@@ -338,7 +349,6 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
             except Exception:
                 pass
 
-    # 2. 查找常见的 Turnstile 外层容器或 iframe 选择器
     turnstile_selectors = [
         'iframe[src*="challenges.cloudflare.com"]',
         'iframe[src*="turnstile"]',
@@ -366,7 +376,6 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
         except Exception:
             pass
 
-    # 3. 针对闭合 Shadow DOM：扫描表单内符合 Turnstile 尺寸 (约 300x65) 的块级元素
     try:
         divs = page.locator("form div")
         count = divs.count()
@@ -380,10 +389,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
                 and 240 <= box["width"] <= 420
                 and 55 <= box["height"] <= 80
             ):
-                # 排除包含输入框或按钮的普通容器
-                if (
-                    div.locator("input, button").count() == 0
-                ):
+                if div.locator("input, button").count() == 0:
                     target_x = box["x"] + 28
                     target_y = box["y"] + box["height"] / 2
                     page.mouse.move(target_x, target_y, steps=8)
@@ -394,7 +400,6 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
     except Exception:
         pass
 
-    # 4. 根据密码框与提交按钮之间的空白区域推算 Turnstile 坐标
     if password_locator and submit_locator:
         try:
             pw_box = password_locator.bounding_box()
@@ -432,7 +437,6 @@ def wait_and_solve_turnstile(
             return True
 
         elapsed = time.time() - start_time
-        # 页面加载 3 秒后若按钮仍禁用，每隔 5 秒尝试点击一次验证框
         if elapsed >= 3.0 and int(elapsed) // 5 > click_attempts:
             click_attempts += 1
             log(f"⏳ 登录按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
@@ -447,6 +451,23 @@ def wait_and_solve_turnstile(
     return is_submit_ready(submit)
 
 
+def wait_for_server_panel_loaded(page, timeout_sec=15):
+    """等待服务器详情页右侧状态卡片渲染完成"""
+    start_time = time.time()
+    while time.time() - start_time < timeout_sec:
+        try:
+            body_text = page.locator("body").inner_text()
+            if any(
+                kw in body_text.upper()
+                for kw in ["EXPIRES", "UPTIME", "CPU LOAD", "RENEW"]
+            ):
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+    return False
+
+
 def login_if_needed(page):
     page.goto(
         SERVER_URL,
@@ -456,7 +477,6 @@ def login_if_needed(page):
 
     page.wait_for_timeout(3000)
 
-    # 如果遇到全屏 Cloudflare 五秒盾，先尝试点击等待
     for _ in range(3):
         title_text = (page.title() or "").lower()
         body_lower = page.locator("body").inner_text().lower()
@@ -478,6 +498,7 @@ def login_if_needed(page):
         "/server/" in page.url
         and "password" not in body
     ):
+        wait_for_server_panel_loaded(page)
         return True
 
     email = first_visible(
@@ -566,7 +587,6 @@ def login_if_needed(page):
         log("❌ 点击登录按钮超时")
         return False
 
-    # 等待登录跳转完成
     for _ in range(10):
         page.wait_for_timeout(1500)
         if "/auth/" not in page.url and "/login" not in page.url:
@@ -598,9 +618,23 @@ def login_if_needed(page):
             wait_until="domcontentloaded",
             timeout=60000,
         )
-        page.wait_for_timeout(3000)
 
+    wait_for_server_panel_loaded(page)
     return "/server/" in page.url
+
+
+def is_renew_limit_reached(body_text):
+    """检测是否处于未满续期窗口状态（如 Maximum 14 days reached）"""
+    limit_patterns = [
+        r"Renew\s+Limit\s+Reached",
+        r"Maximum\s+\d+\s+days?\s+reached",
+        r"You\s+can\s+renew\s+again\s+tomorrow",
+        r"when\s+it\s+drops\s+below\s+\d+\s+days?",
+    ]
+    for pattern in limit_patterns:
+        if re.search(pattern, body_text, re.I):
+            return True
+    return False
 
 
 def get_renewal_text(page):
@@ -608,6 +642,18 @@ def get_renewal_text(page):
         "body"
     ).inner_text()
 
+    # 1. 匹配新版 Jexactyl 面板卡片格式：EXPIRES 6 NOV \n 17 Days
+    expires_match = re.search(
+        r"EXPIRES\s+([A-Z0-9\s]+?)\s*\n+\s*(\d+\s*Days?)",
+        text,
+        re.I,
+    )
+    if expires_match:
+        exp_date = expires_match.group(1).strip()
+        days_str = expires_match.group(2).strip()
+        return f"{days_str} (EXPIRES {exp_date})"
+
+    # 2. 兼容旧版格式
     patterns = [
         r"Renewal\s+in\s+\d+\s+Days?",
         r"Renew\s+in\s+\d+\s+Days?",
@@ -620,9 +666,17 @@ def get_renewal_text(page):
             text,
             re.I,
         )
-
         if match:
             return match.group(0)
+
+    # 3. 匹配达到上限的提示
+    max_match = re.search(
+        r"Maximum\s+\d+\s+days?\s+reached",
+        text,
+        re.I,
+    )
+    if max_match:
+        return max_match.group(0)
 
     if re.search(
         r"Renew\s+Limit\s+Reached",
@@ -635,27 +689,34 @@ def get_renewal_text(page):
 
 
 def find_renew_button(page):
+    """查找真正的续期按钮，严格排除 Upgrade/Premium 广告链接"""
     candidates = [
         page.get_by_role(
             "button",
             name=re.compile(
-                r"^Renew(?:\s+Now|\s+Server)?$",
+                r"^(?:Renew(?:\s+Now|\s+Server|\s+for\s+free)?|Extend(?:\s+Server)?|Add\s+\d+\s+days?)$",
                 re.I,
             ),
         ),
         page.get_by_role(
             "link",
             name=re.compile(
-                r"^Renew(?:\s+Now|\s+Server)?$",
+                r"^(?:Renew(?:\s+Now|\s+Server|\s+for\s+free)?|Extend(?:\s+Server)?)$",
                 re.I,
             ),
         ),
-        page.locator(
-            'button:has-text("Renew")'
+        page.locator("button").filter(
+            has_text=re.compile(r"\bRenew\b", re.I)
         ),
-        page.locator(
-            'a:has-text("Renew")'
-        ),
+    ]
+
+    ignore_words = [
+        "upgrade",
+        "premium",
+        "slow server",
+        "no renewals",
+        "maximum",
+        "limit reached",
     ]
 
     for group in candidates:
@@ -665,8 +726,14 @@ def find_renew_button(page):
             for i in range(count):
                 item = group.nth(i)
 
-                if item.is_visible():
-                    return item
+                if not item.is_visible():
+                    continue
+
+                btn_text = (item.inner_text() or "").strip().lower()
+                if any(w in btn_text for w in ignore_words):
+                    continue
+
+                return item
 
         except Exception:
             pass
@@ -674,8 +741,11 @@ def find_renew_button(page):
     return None
 
 
-def confirm_renewal(page):
-    """Wait for the renewal dialog and click the real submit button."""
+def confirm_renewal(page, before):
+    """
+    等待续期确认弹窗并点击确认；
+    如果新版面板点击 Renew 后无弹窗直接完成续期，也自动识别为成功。
+    """
     title = page.get_by_text(
         re.compile(
             r"Confirm\s+server\s+renewal",
@@ -683,14 +753,28 @@ def confirm_renewal(page):
         )
     ).first
 
+    dialog_appeared = False
     try:
         title.wait_for(
             state="visible",
-            timeout=8000,
+            timeout=6000,
         )
+        dialog_appeared = True
     except Exception:
-        log("❌ 点击 Renew 后未出现续期确认弹窗")
-        return False
+        pass
+
+    if not dialog_appeared:
+        # 检查是否点击第一层按钮后可能弹出了 Turnstile 或者已经直接续期成功
+        click_turnstile_box(page)
+        page.wait_for_timeout(2000)
+        body_text = page.locator("body").inner_text()
+        after = get_renewal_text(page)
+        if renewal_succeeded(before, after, body_text):
+            log("✅ 无需二次弹窗，已直接触发续期")
+            return True
+
+        log("⚠️ 未检测到标准确认弹窗，继续检查续期结果...")
+        return True
 
     confirm_buttons = [
         page.get_by_role(
@@ -698,7 +782,7 @@ def confirm_renewal(page):
         ).last.get_by_role(
             "button",
             name=re.compile(
-                r"^Renew\s+now$",
+                r"^Renew(?:\s+now|\s+server)?$",
                 re.I,
             ),
         ),
@@ -746,6 +830,7 @@ def renewal_succeeded(before, after, body_text):
         "renewal successful",
         "successfully renewed",
         "renew limit reached",
+        "maximum 14 days reached",
     ]
 
     if any(word in text for word in success_words):
@@ -785,7 +870,7 @@ def wait_for_renewal_result(page, before):
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
-            page.wait_for_timeout(2000)
+            wait_for_server_panel_loaded(page)
 
     return False, after
 
@@ -795,7 +880,6 @@ def resolve_headless():
         return True
     if HEADLESS_MODE in ("false", "0", "no"):
         return False
-    # auto 模式：若存在 DISPLAY（如 xvfb-run），优先使用有头模式降低风控
     return not bool(os.getenv("DISPLAY"))
 
 
@@ -851,7 +935,6 @@ def main():
             args=launch_args,
         )
 
-        # 获取当前浏览器原生 UA 并抹除 HeadlessChrome 标记，确保平台与内核版本完全一致
         temp_page = browser.new_page()
         native_ua = temp_page.evaluate("() => navigator.userAgent")
         temp_page.close()
@@ -898,13 +981,9 @@ def main():
                 "body"
             ).inner_text()
 
-            if re.search(
-                r"Renew\s+Limit\s+Reached",
-                body,
-                re.I,
-            ):
+            if is_renew_limit_reached(body):
                 log(
-                    "⏳ 目前未到续期时间，"
+                    "⏳ 目前未到续期时间（Maximum 14 days reached），"
                     "不进行操作"
                 )
 
@@ -931,7 +1010,7 @@ def main():
                         "⚠️ Host-Ship 需要检查",
                         (
                             "没有找到可用的 "
-                            f"Renew 按钮；{before}"
+                            f"Renew 按钮；当前状态：{before}"
                         ),
                         ip,
                     )
@@ -967,7 +1046,7 @@ def main():
 
             button.click()
 
-            if not confirm_renewal(page):
+            if not confirm_renewal(page, before):
                 page.screenshot(
                     path="hostship_confirm_fail.png",
                     full_page=True,
