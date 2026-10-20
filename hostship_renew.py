@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 
@@ -30,7 +31,30 @@ MANUAL_RUN = os.getenv(
     "false"
 ).lower() == "true"
 
+HEADLESS_MODE = os.getenv(
+    "HEADLESS",
+    "auto"
+).strip().lower()
+
 BJ_TZ = ZoneInfo("Asia/Shanghai")
+
+STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined
+});
+window.chrome = window.chrome || {
+    runtime: {},
+    loadTimes: function() {},
+    csi: function() {},
+    app: {}
+};
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en']
+});
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5]
+});
+"""
 
 
 def log(msg):
@@ -267,6 +291,162 @@ def first_visible(page, selectors):
     return None
 
 
+def is_submit_ready(submit):
+    try:
+        if not submit.is_visible():
+            return False
+
+        if submit.is_disabled():
+            return False
+
+        btn_text = (submit.inner_text() or "").strip().lower()
+        if "security check" in btn_text:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+def click_turnstile_box(page, password_locator=None, submit_locator=None):
+    """尝试定位并点击 Cloudflare Turnstile 验证框"""
+    # 1. 优先尝试直接从 frames 中点击 Cloudflare 内部复选框
+    for frame in page.frames:
+        frame_url = (frame.url or "").lower()
+        if "challenges.cloudflare.com" in frame_url or "turnstile" in frame_url:
+            try:
+                cb = frame.locator('input[type="checkbox"], [role="checkbox"]').first
+                if cb.count() and cb.is_visible():
+                    cb.click(timeout=3000)
+                    log("🖱️ 已通过 iframe 内部元素点击 Turnstile")
+                    return True
+            except Exception:
+                pass
+
+            try:
+                frame_el = frame.frame_element()
+                box = frame_el.bounding_box()
+                if box and box["width"] >= 100 and box["height"] >= 35:
+                    target_x = box["x"] + 28
+                    target_y = box["y"] + box["height"] / 2
+                    page.mouse.move(target_x, target_y, steps=8)
+                    time.sleep(0.15)
+                    page.mouse.click(target_x, target_y)
+                    log("🖱️ 已通过 iframe 坐标点击 Turnstile")
+                    return True
+            except Exception:
+                pass
+
+    # 2. 查找常见的 Turnstile 外层容器或 iframe 选择器
+    turnstile_selectors = [
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[src*="turnstile"]',
+        'iframe[title*="Cloudflare" i]',
+        'iframe[title*="widget" i]',
+        '.cf-turnstile',
+        '[data-sitekey]',
+        '[id*="turnstile" i]',
+        '[class*="turnstile" i]',
+    ]
+
+    for selector in turnstile_selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() and loc.is_visible():
+                box = loc.bounding_box()
+                if box and box["width"] >= 150 and box["height"] >= 40:
+                    target_x = box["x"] + 28
+                    target_y = box["y"] + box["height"] / 2
+                    page.mouse.move(target_x, target_y, steps=8)
+                    time.sleep(0.15)
+                    page.mouse.click(target_x, target_y)
+                    log(f"🖱️ 已通过容器 ({selector}) 坐标点击 Turnstile")
+                    return True
+        except Exception:
+            pass
+
+    # 3. 针对闭合 Shadow DOM：扫描表单内符合 Turnstile 尺寸 (约 300x65) 的块级元素
+    try:
+        divs = page.locator("form div")
+        count = divs.count()
+        for i in range(count):
+            div = divs.nth(i)
+            if not div.is_visible():
+                continue
+            box = div.bounding_box()
+            if (
+                box
+                and 240 <= box["width"] <= 420
+                and 55 <= box["height"] <= 80
+            ):
+                # 排除包含输入框或按钮的普通容器
+                if (
+                    div.locator("input, button").count() == 0
+                ):
+                    target_x = box["x"] + 28
+                    target_y = box["y"] + box["height"] / 2
+                    page.mouse.move(target_x, target_y, steps=8)
+                    time.sleep(0.15)
+                    page.mouse.click(target_x, target_y)
+                    log("🖱️ 已通过表单内尺寸匹配点击 Turnstile 区域")
+                    return True
+    except Exception:
+        pass
+
+    # 4. 根据密码框与提交按钮之间的空白区域推算 Turnstile 坐标
+    if password_locator and submit_locator:
+        try:
+            pw_box = password_locator.bounding_box()
+            sub_box = submit_locator.bounding_box()
+            if pw_box and sub_box:
+                pw_bottom = pw_box["y"] + pw_box["height"]
+                gap = sub_box["y"] - pw_bottom
+                if gap >= 50:
+                    target_x = sub_box["x"] + 28
+                    target_y = pw_bottom + (gap / 2)
+                    page.mouse.move(target_x, target_y, steps=8)
+                    time.sleep(0.15)
+                    page.mouse.click(target_x, target_y)
+                    log("🖱️ 已通过密码框与提交按钮间距点击 Turnstile 区域")
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
+def wait_and_solve_turnstile(
+    page,
+    submit,
+    password_locator=None,
+    timeout_sec=35,
+):
+    """等待安全验证完成，必要时主动点击 Turnstile"""
+    start_time = time.time()
+    click_attempts = 0
+
+    while time.time() - start_time < timeout_sec:
+        if is_submit_ready(submit):
+            log("✅ 安全验证已通过，登录按钮已激活")
+            return True
+
+        elapsed = time.time() - start_time
+        # 页面加载 3 秒后若按钮仍禁用，每隔 5 秒尝试点击一次验证框
+        if elapsed >= 3.0 and int(elapsed) // 5 > click_attempts:
+            click_attempts += 1
+            log(f"⏳ 登录按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
+            click_turnstile_box(
+                page,
+                password_locator=password_locator,
+                submit_locator=submit,
+            )
+
+        page.wait_for_timeout(1000)
+
+    return is_submit_ready(submit)
+
+
 def login_if_needed(page):
     page.goto(
         SERVER_URL,
@@ -274,7 +454,21 @@ def login_if_needed(page):
         timeout=60000,
     )
 
-    time.sleep(2)
+    page.wait_for_timeout(3000)
+
+    # 如果遇到全屏 Cloudflare 五秒盾，先尝试点击等待
+    for _ in range(3):
+        title_text = (page.title() or "").lower()
+        body_lower = page.locator("body").inner_text().lower()
+        if (
+            "just a moment" in title_text
+            or "verify you are human" in body_lower
+        ):
+            log("🛡️ 检测到 Cloudflare 全屏拦截页，尝试通过...")
+            click_turnstile_box(page)
+            page.wait_for_timeout(4000)
+        else:
+            break
 
     body = page.locator(
         "body"
@@ -322,9 +516,16 @@ def login_if_needed(page):
         )
         return False
 
-    log("🔐 正在登录 Host-Ship...")
+    log("🔐 正在填写登录信息...")
 
+    email.click()
+    page.wait_for_timeout(200)
     email.fill(HOSTSHIP_LOGIN)
+
+    page.wait_for_timeout(300)
+
+    password.click()
+    page.wait_for_timeout(200)
     password.fill(HOSTSHIP_PASSWORD)
 
     submit = first_visible(
@@ -341,9 +542,35 @@ def login_if_needed(page):
         log("❌ 没找到登录按钮")
         return False
 
-    submit.click()
+    if not wait_and_solve_turnstile(
+        page,
+        submit,
+        password_locator=password,
+        timeout_sec=35,
+    ):
+        btn_label = ""
+        try:
+            btn_label = submit.inner_text().strip()
+        except Exception:
+            pass
+        log(
+            "⚠️ 登录按钮始终处于禁用状态 "
+            f"({btn_label or 'disabled'})，未能通过 Cloudflare 安全验证"
+        )
+        return False
 
-    page.wait_for_timeout(3000)
+    log("🚀 点击登录按钮...")
+    try:
+        submit.click(timeout=10000)
+    except PlaywrightTimeoutError:
+        log("❌ 点击登录按钮超时")
+        return False
+
+    # 等待登录跳转完成
+    for _ in range(10):
+        page.wait_for_timeout(1500)
+        if "/auth/" not in page.url and "/login" not in page.url:
+            break
 
     text = page.locator(
         "body"
@@ -352,27 +579,26 @@ def login_if_needed(page):
     challenge_words = [
         "captcha",
         "verify you are human",
-        "security check",
-        "cloudflare",
+        "complete the security check",
     ]
 
-    if any(
-        word in text
-        for word in challenge_words
+    if (
+        "/server/" not in page.url
+        and any(word in text for word in challenge_words)
     ):
         log(
             "⚠️ 检测到验证码/"
-            "安全验证，需要手动处理"
+            "安全验证未通过"
         )
         return False
 
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
-
-    page.wait_for_timeout(2000)
+    if "/server/" not in page.url:
+        page.goto(
+            SERVER_URL,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(3000)
 
     return "/server/" in page.url
 
@@ -564,6 +790,15 @@ def wait_for_renewal_result(page, before):
     return False, after
 
 
+def resolve_headless():
+    if HEADLESS_MODE in ("true", "1", "yes"):
+        return True
+    if HEADLESS_MODE in ("false", "0", "no"):
+        return False
+    # auto 模式：若存在 DISPLAY（如 xvfb-run），优先使用有头模式降低风控
+    return not bool(os.getenv("DISPLAY"))
+
+
 def main():
     if not SERVER_URL.startswith(
         "https://panel.host-ship.com/server/"
@@ -591,32 +826,46 @@ def main():
         f"📍 当前出口IP：{ip}"
     )
 
+    use_headless = resolve_headless()
+    log(
+        f"🖥️ 浏览器模式：{'Headless' if use_headless else 'Headed (XVFB/GUI)'}"
+    )
+
     with sync_playwright() as p:
+        launch_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--window-size=1440,1000",
+        ]
+
         browser = p.chromium.launch(
-            headless=True,
+            headless=use_headless,
             proxy={
                 "server": PROXY_SERVER
             }
             if IS_PROXY
             else None,
-            args=[
-                "--no-sandbox"
-            ],
+            args=launch_args,
         )
+
+        # 获取当前浏览器原生 UA 并抹除 HeadlessChrome 标记，确保平台与内核版本完全一致
+        temp_page = browser.new_page()
+        native_ua = temp_page.evaluate("() => navigator.userAgent")
+        temp_page.close()
+        clean_ua = native_ua.replace("HeadlessChrome/", "Chrome/")
 
         context = browser.new_context(
             viewport={
                 "width": 1440,
                 "height": 1000,
             },
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
+            user_agent=clean_ua,
+            locale="en-US",
         )
+        context.add_init_script(STEALTH_INIT_SCRIPT)
 
         page = context.new_page()
 
@@ -630,7 +879,7 @@ def main():
                 tg(
                     build_error_message(
                         "❌ Host-Ship 登录失败",
-                        "登录失败或遇到安全验证",
+                        "登录失败或遇到 Cloudflare 安全验证拦截",
                         ip,
                     )
                 )
